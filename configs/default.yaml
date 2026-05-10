@@ -1,0 +1,68 @@
+# Default training config for PP-DocLayoutV3 fine-tuning.
+# Any key here can be overridden on the CLI: `python train.py --config configs/default.yaml --epochs 5`.
+
+# ---- data --------------------------------------------------------------------
+# `data` is the dataset root. If it contains train/ and val/ subfolders, those
+# are auto-used. To override, set `train_data` and/or `val_data` explicitly.
+data: ./datasets/vbhc_deduplicated_labeled
+# train_data: ./datasets/vbhc_deduplicated_labeled/train
+# val_data: ./datasets/vbhc_deduplicated_labeled/val
+checkpoint: ./models           # pretrained PP-DocLayoutV3 weights (HF format)
+out: ./checkpoints             # where to save fine-tuned checkpoints (best/ + last/)
+
+# ---- training ----------------------------------------------------------------
+epochs: 10
+batch_size: 2
+lr: 1.0e-4
+weight_decay: 1.0e-4
+clip_grad: 0.1
+num_workers: 0
+log_every: 10
+device: cuda                   # cuda | cpu
+seed: 42
+max_steps: -1                  # -1 = run all epochs; otherwise stop after N optimizer steps
+
+# ---- early stopping ----------------------------------------------------------
+# After every epoch we evaluate on val_data and save `best/` when val_loss
+# improves by more than `min_delta`. Training stops if val_loss fails to
+# improve for `patience` consecutive epochs.
+patience: 5
+min_delta: 0.0
+
+# ---- labels ------------------------------------------------------------------
+# Set `label_list` to override the default 25-class PP-DocLayoutV3 label list.
+# When the size differs from the pretrained checkpoint, the classification heads
+# (enc_score_head, decoder.class_embed, denoising_class_embed) are reinitialized
+# while everything else (backbone / encoder / decoder / mask / order) is kept.
+#
+# Example custom 4-class set:
+# label_list:
+#   - text
+#   - title
+#   - figure
+#   - table
+label_list:
+  - text
+  - doc_title
+  - paragraph_title
+  - header
+  - footer
+  - image
+  - chart
+  - table
+  - caption
+  - formula
+  - seal
+  - number
+
+# Optional alias map. Keys are dataset spellings, values are canonical names
+# from `label_list` ("" means "skip this shape").
+# Example:
+# label_aliases:
+#   formula: display_formula
+#   reading_order: ""
+label_aliases:
+  reading_order: ""
+  row: ""
+  col: ""
+  TEXTLINE: ""

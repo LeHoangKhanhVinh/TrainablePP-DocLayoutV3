@@ -1,0 +1,25 @@
+# PyTorch — pick the channel that matches your GPU.
+# RTX 50-series (Blackwell, sm_120) requires the cu128 wheels:
+--extra-index-url https://download.pytorch.org/whl/cu128
+# RTX 30/40-series can use cu121 (older but smaller download):
+# --extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.5
+torchvision
+
+# Hugging Face — PP-DocLayoutV3 was added in transformers 5.x.
+transformers>=5.8
+
+# Vision / numerics used by src/
+numpy
+pillow
+opencv-python-headless    # cv2.fillPoly, cv2.findContours
+scipy                     # scipy.optimize.linear_sum_assignment (RT-DETR matcher)
+
+# Config + utilities
+pyyaml                    # train.py --config
+tqdm
+
+# Windows-only: torch 2.5/2.6 fbgemm.dll on some boxes needs an OpenMP runtime.
+# If `import torch` fails with "fbgemm.dll or one of its dependencies",
+# uncomment the next line:
+# intel-openmp
