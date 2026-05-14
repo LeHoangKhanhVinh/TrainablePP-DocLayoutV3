@@ -1,8 +1,19 @@
 """Trainable subclass of ``PPDocLayoutV3ForObjectDetection``.
 
 The shipped class hard-raises when ``labels is not None``. We override the
-forward to compute a multi-head loss instead, while keeping the
-inference-without-labels path identical to the parent.
+forward to compute the full PP-DocLayoutV3 multi-head loss instead, while keeping
+the inference-without-labels path identical to the parent.
+
+To match PaddleDetection's loss *exactly*, the encoder-stage proposal must take
+part in the auxiliary loss with its own mask + dice term. The HF
+``PPDocLayoutV3Model`` computes ``enc_out_masks`` internally but discards it, so we
+recover the two ingredients it is built from with lightweight forward hooks:
+
+* ``mask_query_head`` — its **first** call per forward is the encoder-stage
+  ``mask_query_embed``;
+* ``encoder`` — its output carries ``mask_feat``.
+
+and recompute ``enc_out_masks = bmm(mask_query_embed, mask_feat)``.
 """
 
 from __future__ import annotations
@@ -47,6 +58,32 @@ class TrainablePPDocLayoutV3ForObjectDetection(PPDocLayoutV3ForObjectDetection):
         )
         self.criterion: PPDocLayoutV3Loss | None = None
 
+        # ---- encoder-stage mask recovery (see module docstring) -------------------
+        self._mask_query_head_calls: list[torch.Tensor] = []
+        self._enc_mask_feat: torch.Tensor | None = None
+        self.model.mask_query_head.register_forward_hook(self._capture_mask_query_head)
+        self.model.encoder.register_forward_hook(self._capture_encoder)
+
+    def _capture_mask_query_head(self, module, inputs, output):
+        self._mask_query_head_calls.append(output)
+
+    def _capture_encoder(self, module, inputs, output):
+        mask_feat = getattr(output, "mask_feat", None)
+        if mask_feat is None and isinstance(output, (tuple, list)):
+            mask_feat = output[-1]
+        self._enc_mask_feat = mask_feat
+
+    def _compute_enc_masks(self) -> torch.Tensor | None:
+        """Recompute the encoder-stage instance masks from the captured tensors."""
+        if not self._mask_query_head_calls or self._enc_mask_feat is None:
+            return None
+        mask_query_embed = self._mask_query_head_calls[0]  # (B, num_queries, num_prototypes)
+        mask_feat = self._enc_mask_feat                    # (B, num_prototypes, mh, mw)
+        mh, mw = mask_feat.shape[-2:]
+        return torch.bmm(
+            mask_query_embed, mask_feat.flatten(start_dim=2)
+        ).reshape(mask_query_embed.shape[0], -1, mh, mw)
+
     def forward(
         self,
         pixel_values: torch.FloatTensor,
@@ -55,6 +92,10 @@ class TrainablePPDocLayoutV3ForObjectDetection(PPDocLayoutV3ForObjectDetection):
         labels: list[dict] | None = None,
         **kwargs,
     ):
+        # Reset hook capture buffers for this forward pass.
+        self._mask_query_head_calls = []
+        self._enc_mask_feat = None
+
         outputs = self.model(
             pixel_values,
             pixel_mask=pixel_mask,
@@ -89,6 +130,7 @@ class TrainablePPDocLayoutV3ForObjectDetection(PPDocLayoutV3ForObjectDetection):
                     "TrainablePPDocLayoutV3ForObjectDetection.criterion is not set; "
                     "assign a PPDocLayoutV3Loss before training."
                 )
+            enc_topk_masks = self._compute_enc_masks()
             loss, loss_dict = self.criterion(
                 intermediate_logits=intermediate_logits,
                 intermediate_reference_points=intermediate_refp,
@@ -96,9 +138,14 @@ class TrainablePPDocLayoutV3ForObjectDetection(PPDocLayoutV3ForObjectDetection):
                 out_order_logits=order_logits,
                 enc_topk_logits=outputs.enc_topk_logits,
                 enc_topk_bboxes=outputs.enc_topk_bboxes,
+                enc_topk_masks=enc_topk_masks,
                 denoising_meta_values=outputs.denoising_meta_values,
                 targets=labels,
             )
+
+        # Release captured tensors so they are not held past the loss computation.
+        self._mask_query_head_calls = []
+        self._enc_mask_feat = None
 
         return PPDocLayoutV3TrainOutput(
             loss=loss,

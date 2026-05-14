@@ -23,16 +23,20 @@ import json
 import os
 from typing import Any
 
+import numpy as np
 import torch
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 
 from src import (
+    DocLayoutV3PostProcess,
     LabelMap,
     LabelmeLayoutDataset,
+    LayoutMetric,
     PPDocLayoutV3Loss,
     TrainablePPDocLayoutV3ForObjectDetection,
+    build_sample_transforms,
     collate_fn,
 )
 
@@ -50,6 +54,8 @@ DEFAULTS: dict[str, Any] = {
     "label_list": None,
     "label_aliases": None,
     "image_size": 800,
+    "eval_transforms": None,
+    "postprocess": None,
 }
 
 
@@ -106,63 +112,42 @@ def resolve_test_split(cfg: dict[str, Any]) -> str:
     return test_path
 
 
-def post_process(outputs, target_sizes, threshold: float):
-    """Decode raw model outputs to per-image detections sorted by reading order.
+def post_process(outputs, target_sizes, threshold: float, processor: DocLayoutV3PostProcess):
+    """Decode raw model outputs via the ported ``DocLayoutV3PostProcess``.
 
     Returns a list (one dict per image) with keys: ``scores``, ``labels``,
     ``boxes`` (xyxy in original-image pixels), ``order_seq`` (rank, 0 = first).
     """
-    boxes = outputs.pred_boxes  # (B, Q, 4) cxcywh, normalized
-    logits = outputs.logits     # (B, Q, C)
-    order_logits = outputs.order_logits  # (B, Q, Q)
-
-    cx, cy, w, h = boxes.unbind(-1)
-    boxes_xyxy = torch.stack(
-        [cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], dim=-1
+    head_out = (
+        outputs.pred_boxes,      # (B, Q, 4) cxcywh, normalized
+        outputs.logits,          # (B, Q, C)
+        outputs.order_logits,    # (B, Q, Q)
+        outputs.out_masks,       # (B, Q, h, w)
     )
-
-    target_sizes_t = torch.as_tensor(target_sizes, device=boxes.device, dtype=boxes_xyxy.dtype)
-    img_h, img_w = target_sizes_t.unbind(1)
-    scale = torch.stack([img_w, img_h, img_w, img_h], dim=1).unsqueeze(1)
-    boxes_xyxy = boxes_xyxy * scale
-
-    # Pairwise -> per-query rank via the same voting scheme as the official processor.
-    order_scores = torch.sigmoid(order_logits)
-    order_votes = (
-        order_scores.triu(diagonal=1).sum(dim=1)
-        + (1.0 - order_scores.transpose(1, 2)).tril(diagonal=-1).sum(dim=1)
+    orig = torch.as_tensor(
+        target_sizes, device=outputs.pred_boxes.device, dtype=torch.float32
     )
-    order_pointers = torch.argsort(order_votes, dim=1)
-    order_seq = torch.empty_like(order_pointers)
-    ranks = torch.arange(
-        order_pointers.shape[1], device=order_pointers.device, dtype=order_pointers.dtype
-    ).expand(*order_pointers.shape)
-    order_seq.scatter_(1, order_pointers, ranks)
-
-    num_queries = logits.shape[1]
-    num_classes = logits.shape[2]
-    scores_flat = logits.sigmoid().flatten(1)
-    scores, index = torch.topk(scores_flat, num_queries, dim=-1)
-    labels = index % num_classes
-    query_idx = index // num_classes
-    boxes_xyxy = boxes_xyxy.gather(1, query_idx.unsqueeze(-1).expand(-1, -1, 4))
-    order_seq = order_seq.gather(1, query_idx)
+    bbox_pred, _, _ = processor(head_out, orig)  # [B*num_top, 7]
+    bs = orig.shape[0]
+    bbox_pred = bbox_pred.reshape(bs, -1, 7)
 
     results = []
-    for s, l, b, o in zip(scores, labels, boxes_xyxy, order_seq):
-        keep = s >= threshold
-        s_k, l_k, b_k, o_k = s[keep], l[keep], b[keep], o[keep]
+    for per in bbox_pred:
+        labels = per[:, 0].long()
+        scores = per[:, 1]
+        boxes = per[:, 2:6]
+        order = per[:, 6]
+        keep = scores >= threshold
+        s_k, l_k, b_k, o_k = scores[keep], labels[keep], boxes[keep], order[keep]
         if s_k.numel() == 0:
             results.append({
-                "scores": s_k.cpu(),
-                "labels": l_k.cpu(),
-                "boxes": b_k.cpu(),
-                "order_seq": o_k.cpu(),
+                "scores": s_k.cpu(), "labels": l_k.cpu(),
+                "boxes": b_k.cpu(), "order_seq": o_k.long().cpu(),
             })
             continue
-        o_sorted, idx = torch.sort(o_k)
+        _, idx = torch.sort(o_k)
         # Re-rank to dense 0..N-1 so downstream consumers see contiguous ranks.
-        dense = torch.arange(o_sorted.numel(), dtype=o_sorted.dtype)
+        dense = torch.arange(idx.numel(), dtype=torch.long)
         results.append({
             "scores": s_k[idx].cpu(),
             "labels": l_k[idx].cpu(),
@@ -311,8 +296,13 @@ def main() -> None:
 
     test_path = resolve_test_split(cfg)
     print(f"[data] test {test_path}")
+    eval_sample_tf = (
+        build_sample_transforms(cfg["eval_transforms"])
+        if cfg.get("eval_transforms") else None
+    )
     test_set = LabelmeLayoutDataset(
-        test_path, image_size=int(cfg["image_size"]), label_map=label_map
+        test_path, image_size=int(cfg["image_size"]), label_map=label_map,
+        sample_transforms=eval_sample_tf,
     )
     print(f"[data] {len(test_set)} samples")
     loader = DataLoader(
@@ -337,6 +327,20 @@ def main() -> None:
     palette = _palette(label_map.num_classes)
     threshold = float(cfg["threshold"])
 
+    pp_cfg = cfg.get("postprocess") or {}
+    processor = DocLayoutV3PostProcess(
+        num_classes=label_map.num_classes,
+        num_top_queries=int(pp_cfg.get("num_top_queries", 300)),
+        use_focal_loss=True,
+        with_mask=True,
+        mask_threshold=float(pp_cfg.get("mask_threshold", 0.5)),
+        resize_mask=bool(pp_cfg.get("resize_mask", False)),
+        use_avg_mask_score=bool(pp_cfg.get("use_avg_mask_score", False)),
+    )
+    print(f"[postprocess] num_top_queries={processor.num_top_queries} "
+          f"resize_mask={processor.resize_mask}")
+
+    metric = LayoutMetric(num_classes=label_map.num_classes)
     total_loss = 0.0
     n_batches = 0
     sample_idx = 0
@@ -365,7 +369,37 @@ def main() -> None:
                 json_paths.append(jp)
                 sample_idx += 1
 
-            results = post_process(outputs, target_sizes, threshold=threshold)
+            # ---- metrics: decode in normalised coords, score vs ground truth -------
+            bs = pixel_values.shape[0]
+            ones = torch.ones(bs, 2, device=device)
+            head_out = (outputs.pred_boxes, outputs.logits,
+                        outputs.order_logits, outputs.out_masks)
+            raw_pred, _, _ = processor(head_out, ones)
+            raw_pred = raw_pred.reshape(bs, -1, 7).cpu().numpy()
+            preds, gts = [], []
+            for i in range(bs):
+                per = raw_pred[i]
+                preds.append({
+                    "boxes": per[:, 2:6], "scores": per[:, 1],
+                    "labels": per[:, 0].astype(np.int64), "order": per[:, 6],
+                })
+                g = labels[i]
+                gb = g["boxes"].detach().cpu().numpy().reshape(-1, 4)  # cxcywh norm
+                if len(gb):
+                    gxyxy = np.stack([
+                        gb[:, 0] - gb[:, 2] / 2, gb[:, 1] - gb[:, 3] / 2,
+                        gb[:, 0] + gb[:, 2] / 2, gb[:, 1] + gb[:, 3] / 2,
+                    ], axis=1)
+                else:
+                    gxyxy = np.zeros((0, 4), dtype=np.float32)
+                gts.append({
+                    "boxes": gxyxy,
+                    "labels": g["class_labels"].detach().cpu().numpy(),
+                    "order": g["order_rank"].detach().cpu().numpy(),
+                })
+            metric.update(preds, gts)
+
+            results = post_process(outputs, target_sizes, threshold, processor)
             for jp, det in zip(json_paths, results):
                 if save_mode in ("labelme", "both"):
                     save_labelme(jp, labelme_dir, det, label_map)
@@ -374,7 +408,15 @@ def main() -> None:
                 print(f"[eval] {os.path.basename(jp)}: {det['boxes'].shape[0]} dets")
 
     if n_batches > 0:
-        print(f"[eval] mean test loss: {total_loss / n_batches:.4f}")
+        print(f"[test] mean test loss: {total_loss / n_batches:.4f}")
+    m = metric.compute()
+    order_score = m["order_score"]
+    order_str = "n/a" if order_score != order_score else f"{order_score:.4f}"
+    print(
+        f"[test] metrics over {m['num_images']} images | "
+        f"mAP {m['mAP']:.4f} | AP50 {m['AP50']:.4f} | AP75 {m['AP75']:.4f} | "
+        f"order_score {order_str} (1 - NED over {m['order_items']} matched items)"
+    )
     print(f"[eval] wrote outputs to {out_dir}")
 
 

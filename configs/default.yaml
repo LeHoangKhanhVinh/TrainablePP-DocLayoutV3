@@ -1,5 +1,11 @@
 # Default training config for PP-DocLayoutV3 fine-tuning.
 # Any key here can be overridden on the CLI: `python train.py --config configs/default.yaml --epochs 5`.
+#
+# The loss / matcher / optimizer / LR-schedule values below are the
+# PP-DocLayoutV3 recipe, merged in from PaddleDetection's
+# configs/layout_analysis/PP-DocLayoutV3.yaml (only the parts that this repo
+# actually consumes — the dataset, readers and model architecture are this
+# repo's own).
 
 # ---- data --------------------------------------------------------------------
 # `data` is the dataset root. If it contains train/ and val/ subfolders, those
@@ -10,22 +16,123 @@ data: ./datasets/vbhc_deduplicated_labeled
 checkpoint: ./models           # pretrained PP-DocLayoutV3 weights (HF format)
 out: ./checkpoints             # where to save fine-tuned checkpoints (best/ + last/)
 
-# ---- training ----------------------------------------------------------------
-epochs: 10
-batch_size: 2
-lr: 1.0e-4
-weight_decay: 1.0e-4
-clip_grad: 0.1
+# ---- training (PP-DocLayoutV3 recipe) ----------------------------------------
+epochs: 200
+batch_size: 1
+lr: 2.0e-4                     # LearningRate.base_lr
+weight_decay: 1.0e-4           # OptimizerBuilder.optimizer (AdamW) weight_decay
+clip_grad: 0.1                 # OptimizerBuilder.clip_grad_by_norm
 num_workers: 0
 log_every: 10
 device: cuda                   # cuda | cpu
 seed: 42
 max_steps: -1                  # -1 = run all epochs; otherwise stop after N optimizer steps
+drop_last: true                # TrainReader.drop_last — drop the last incomplete batch
+# DocLayoutV3Transformer.num_denoising — the PP-DocLayoutV3 recipe trains with
+# contrastive denoising OFF (0). Overrides the HF checkpoint's config value.
+num_denoising: 0
+
+# ---- EMA (exponential moving average of weights) -----------------------------
+# Mirrors PaddleDetection's `use_ema`. When enabled, the EMA weights are what
+# get evaluated each epoch and saved to best/ and last/ (training itself still
+# uses the raw weights). Port of ppdet/optimizer/ema.py::ModelEMA.
+ema:
+  enabled: true
+  decay: 0.9999                # ema_decay
+  decay_type: exponential      # exponential | threshold | normal
+  gamma: 2000                  # ramp time-constant for decay_type=exponential
+  filter_no_grad: true         # keep frozen params (e.g. backbone stem) verbatim
+
+# ---- LR schedule (LinearWarmup + PiecewiseDecay) -----------------------------
+# Linear warmup from `warmup_start_factor` over `warmup_steps` optimizer steps,
+# then multiply the LR by `gamma` at each epoch in `milestones`.
+lr_schedule:
+  warmup_steps: 100
+  warmup_start_factor: 0.001
+  milestones: [100]
+  gamma: 1.0
+
+# ---- loss (DocLayoutV3Loss) --------------------------------------------------
+# Consumed by src/losses.py::PPDocLayoutV3Loss.
+loss:
+  loss_coeff: {class: 4, bbox: 5, giou: 2, mask: 5, dice: 5, order: 50}
+  use_focal_loss: true
+  use_vfl: true
+  vfl_iou_type: mask           # mask | bbox  — IoU target for the varifocal loss
+  aux_loss: true
+  # MaskDINO point-sampling params (defaults shown; usually left unset):
+  # num_sample_points: 12544
+  # oversample_ratio: 3.0
+  # important_sample_ratio: 0.75
+  # Optional reading-order loss config:
+  # order_loss_config:
+  #   robust: gce               # gce | bce
+  #   locality: true
+  #   w_gt: 2.0
+  #   label_smooth: 0.01
+
+# ---- matcher (HungarianMatcher) ----------------------------------------------
+matcher:
+  matcher_coeff: {class: 4, bbox: 5, giou: 2, mask: 5, dice: 5}
+  with_mask: true
+  alpha: 0.25
+  gamma: 2.0
+
+# ---- data preprocessing (PP-DocLayoutV3 TrainReader / EvalReader) ------------
+# Ported PaddleDetection transforms (see src/transforms.py). `train_transforms`
+# run per-sample in the dataset; `train_batch_transforms` run per-batch in the
+# collate fn (BatchRandomResize picks one random scale for the whole batch).
+train_transforms:
+  - Poly2MaskPack: {del_poly: true}
+  - RandomDistort: {prob: 0.8}
+  - UpdateBBoxFromMask: {}
+  - RandomExpand: {prob: 0.5, ratio: 1.5, fill_value: [123.675, 116.28, 103.53]}
+  - RandomCrop: {prob: 0.8, use_box_candidates: true}
+train_batch_transforms:
+  - BatchRandomResize: {target_size: [672, 704, 736, 768, 800, 800, 800, 800, 832, 864, 896, 928], random_size: true, random_interp: true, keep_ratio: false}
+  - UnpackMask: {}
+  - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+  - NormalizeBox: {}
+  - BboxXYXY2XYWH: {}
+  - Permute: {}
+# EvalReader: PaddleDetection's has no mask op; `Poly2Mask` is added here so the
+# repo's eval.py can still compute a validation loss.
+eval_transforms:
+  - Poly2Mask: {del_poly: true}
+  - Resize: {target_size: [800, 800], keep_ratio: false, interp: 2}
+  - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+  - NormalizeBox: {}
+  - BboxXYXY2XYWH: {}
+  - Permute: {}
+
+# ---- post-processing (DocLayoutV3PostProcess) -------------------------------
+postprocess:
+  num_top_queries: 300
+  mask_threshold: 0.5
+  resize_mask: false
+  use_avg_mask_score: false
+
+# ---- best-model selection ----------------------------------------------------
+# After every epoch the model is evaluated on val_data: validation loss AND
+# COCO-style metrics (mAP / AP50 / AP75 + reading-order accuracy) are computed.
+# `best/` is saved according to `criterion`:
+#   - loss    : lowest validation loss wins.
+#   - metrics : highest weighted metric score wins, where the score is
+#               sum(metric_weights[k] * metrics[k]). `metric_weights` should
+#               sum to 1 (it is renormalised if not) and sets each metric's
+#               importance. Available keys: mAP, AP50, AP75, order_score
+#               (order_score = 1 - normalised edit distance; bigger is better).
+best_model:
+  criterion: loss              # loss | metrics
+  metric_weights:
+    mAP: 0.5
+    AP50: 0
+    AP75: 0
+    order_score: 0.5
 
 # ---- early stopping ----------------------------------------------------------
-# After every epoch we evaluate on val_data and save `best/` when val_loss
-# improves by more than `min_delta`. Training stops if val_loss fails to
-# improve for `patience` consecutive epochs.
+# Training stops if the chosen `best_model.criterion` fails to improve by more
+# than `min_delta` for `patience` consecutive epochs.
 patience: 5
 min_delta: 0.0
 
